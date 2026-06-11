@@ -85,3 +85,8 @@ RouteCallable = (
     t.Callable[..., ResponseReturnValue]
     | t.Callable[..., t.Awaitable[ResponseReturnValue]]
 )
+
+ResponseInstrumentationCallable = (
+    t.Callable[["Response", t.Any], None]
+    | t.Callable[["Response", t.Any], t.Awaitable[None]]
+)

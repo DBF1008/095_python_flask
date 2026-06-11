@@ -47,6 +47,9 @@ T_teardown = t.TypeVar("T_teardown", bound=ft.TeardownCallable)
 T_template_filter = t.TypeVar("T_template_filter", bound=ft.TemplateFilterCallable)
 T_template_global = t.TypeVar("T_template_global", bound=ft.TemplateGlobalCallable)
 T_template_test = t.TypeVar("T_template_test", bound=ft.TemplateTestCallable)
+T_response_instrumentation = t.TypeVar(
+    "T_response_instrumentation", bound=ft.ResponseInstrumentationCallable
+)
 
 
 def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
@@ -364,6 +367,16 @@ class App(Scaffold):
         #:
         #: .. versionadded:: 0.11
         self.shell_context_processors: list[ft.ShellContextProcessorCallable] = []
+
+        #: A list of functions that are called after a response has been
+        #: fully assembled (after ``after_request`` handlers and session
+        #: saving).  Each function receives the response and a
+        #: :class:`~flask.instrumentation.ResponseMetadata` instance.
+        #:
+        #: .. versionadded:: 3.2
+        self.response_instrumentation_funcs: list[
+            ft.ResponseInstrumentationCallable
+        ] = []
 
         #: Maps registered blueprint names to blueprint objects. The
         #: dict retains the order the blueprints were registered in.
@@ -863,6 +876,30 @@ class App(Scaffold):
         .. versionadded:: 0.11
         """
         self.shell_context_processors.append(f)
+        return f
+
+    @setupmethod
+    def after_response(
+        self, f: T_response_instrumentation
+    ) -> T_response_instrumentation:
+        """Register a function to be called after a response has been
+        fully assembled, including ``after_request`` handlers and
+        session saving.  The function receives the response object and
+        a :class:`~flask.instrumentation.ResponseMetadata` summary.
+
+        Unlike :meth:`after_request`, this is intended for read-only
+        observation (auditing, logging, metrics).  The return value is
+        ignored and the response should not be modified.
+
+        .. code-block:: python
+
+            @app.after_response
+            def audit(response, metadata):
+                log_to_audit_system(metadata)
+
+        .. versionadded:: 3.2
+        """
+        self.response_instrumentation_funcs.append(f)
         return f
 
     def _find_error_handler(

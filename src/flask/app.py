@@ -49,6 +49,7 @@ from .signals import got_request_exception
 from .signals import request_finished
 from .signals import request_started
 from .signals import request_tearing_down
+from .signals import response_instrumented
 from .templating import Environment
 from .wrappers import Request
 from .wrappers import Response
@@ -1404,6 +1405,13 @@ class Flask(App):
         :return: a new response object or the same, has to be an
                  instance of :attr:`response_class`.
         """
+        has_instrumentation = bool(
+            self.response_instrumentation_funcs
+        ) or bool(response_instrumented.receivers)
+
+        if has_instrumentation:
+            vary_before = frozenset(response.vary)
+
         for func in ctx._after_request_functions:
             response = self.ensure_sync(func)(response)
 
@@ -1412,10 +1420,61 @@ class Flask(App):
                 for func in reversed(self.after_request_funcs[name]):
                     response = self.ensure_sync(func)(response)
 
+        if has_instrumentation:
+            cookies_before_save = response.headers.getlist("Set-Cookie")
+
         if not self.session_interface.is_null_session(ctx._get_session()):
             self.session_interface.save_session(self, ctx._get_session(), response)
 
+        if has_instrumentation:
+            cookies_after_save = response.headers.getlist("Set-Cookie")
+            self._fire_response_instrumentation(
+                ctx, response, vary_before, cookies_before_save, cookies_after_save
+            )
+
         return response
+
+    def _fire_response_instrumentation(
+        self,
+        ctx: AppContext,
+        response: Response,
+        vary_before: frozenset[str],
+        cookies_before_save: list[str],
+        cookies_after_save: list[str],
+    ) -> None:
+        from .instrumentation import ResponseMetadata
+
+        vary_final = frozenset(response.vary)
+        vary_added = vary_final - vary_before
+
+        new_cookie_headers = [
+            h for h in cookies_after_save if h not in cookies_before_save
+        ]
+        session_cookie_set = bool(new_cookie_headers) and any(
+            "Max-Age=0" not in h for h in new_cookie_headers
+        )
+        session_cookie_deleted = bool(new_cookie_headers) and all(
+            "Max-Age=0" in h for h in new_cookie_headers
+        )
+
+        metadata = ResponseMetadata(
+            status_code=response.status_code,
+            method=ctx.request.method,
+            path=ctx.request.path,
+            endpoint=ctx.request.endpoint,
+            json_body=getattr(response, "_instrumentation_json_body", None),
+            session_cookie_set=session_cookie_set,
+            session_cookie_deleted=session_cookie_deleted,
+            vary_added=vary_added,
+            vary_final=vary_final,
+        )
+
+        for func in self.response_instrumentation_funcs:
+            self.ensure_sync(func)(response, metadata)
+
+        response_instrumented.send(
+            self, _async_wrapper=self.ensure_sync, response=response, metadata=metadata
+        )
 
     def do_teardown_request(
         self, ctx: AppContext, exc: BaseException | None = None
