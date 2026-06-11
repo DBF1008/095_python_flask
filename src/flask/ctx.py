@@ -8,6 +8,7 @@ from types import TracebackType
 from werkzeug.exceptions import HTTPException
 from werkzeug.routing import MapAdapter
 
+from . import _tracing
 from . import typing as ft
 from .globals import _cv_app
 from .helpers import _CollectErrors
@@ -336,6 +337,8 @@ class AppContext:
         original push has been popped.
         """
 
+        _tracing.record_create(self)
+
     @classmethod
     def from_environ(cls, app: Flask, environ: WSGIEnvironment, /) -> te.Self:
         """Create an app context with request data from the given WSGI environ.
@@ -361,11 +364,13 @@ class AppContext:
 
         .. versionadded:: 0.10
         """
-        return self.__class__(
+        new = self.__class__(
             self.app,
             request=self._request,
             session=self._session,
         )
+        _tracing.record_copy(self, new)
+        return new
 
     @property
     def request(self) -> Request:
@@ -428,10 +433,12 @@ class AppContext:
         self._push_count += 1
 
         if self._cv_token is not None:
+            _tracing.record_push(self)
             return
 
         self._cv_token = _cv_app.set(self)
         appcontext_pushed.send(self.app, _async_wrapper=self.app.ensure_sync)
+        _tracing.record_push(self)
 
         if self._request is not None:
             # Open the session at the moment that the request context is available.
@@ -481,6 +488,7 @@ class AppContext:
         self._push_count -= 1
 
         if self._push_count > 0:
+            _tracing.record_pop(self, final=False)
             return
 
         collect_errors = _CollectErrors()
@@ -497,6 +505,7 @@ class AppContext:
 
         _cv_app.reset(self._cv_token)
         self._cv_token = None
+        _tracing.record_pop(self, final=True)
 
         with collect_errors:
             appcontext_popped.send(self.app, _async_wrapper=self.app.ensure_sync)
