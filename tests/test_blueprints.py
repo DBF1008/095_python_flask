@@ -1116,3 +1116,319 @@ def test_blueprint_renaming(app, client) -> None:
     assert client.get("/b/a/").data == b"alt.sub.index2"
     assert client.get("/a/error").data == b"Error"
     assert client.get("/b/error").data == b"Error"
+
+
+def test_multiple_registration_url_isolation(app, client):
+    """Registering the same blueprint twice with different url_prefix
+    and name should produce independent URL rules. ``url_for`` for each
+    registration must resolve to the correct prefix, never to the other
+    registration's prefix.
+    """
+    bp = flask.Blueprint("api", __name__)
+
+    @bp.route("/")
+    def index():
+        return flask.request.endpoint
+
+    @bp.route("/item/<int:item_id>")
+    def item(item_id):
+        return f"{flask.request.endpoint}:{item_id}"
+
+    app.register_blueprint(bp, url_prefix="/v1", name="api_v1")
+    app.register_blueprint(bp, url_prefix="/v2", name="api_v2")
+
+    # Each URL resolves to its own prefix.
+    assert client.get("/v1/").data == b"api_v1.index"
+    assert client.get("/v2/").data == b"api_v2.index"
+    assert client.get("/v1/item/42").data == b"api_v1.item:42"
+    assert client.get("/v2/item/42").data == b"api_v2.item:42"
+
+    # url_for builds the correct URL for each registration.
+    with app.test_request_context():
+        assert flask.url_for("api_v1.index") == "/v1/"
+        assert flask.url_for("api_v2.index") == "/v2/"
+        assert flask.url_for("api_v1.item", item_id=7) == "/v1/item/7"
+        assert flask.url_for("api_v2.item", item_id=7) == "/v2/item/7"
+
+
+def test_multiple_registration_error_handler_isolation(app, client):
+    """Each registration of the same blueprint should have its own
+    error handler mapping. An error raised in one registration's view
+    must be handled by that registration's handler, never by the other
+    registration's handler.
+    """
+    bp = flask.Blueprint("api", __name__)
+
+    @bp.errorhandler(403)
+    def forbidden(e):
+        return f"{flask.request.endpoint}:forbidden", 403
+
+    @bp.route("/fail")
+    def fail():
+        flask.abort(403)
+
+    @bp.route("/ok")
+    def ok():
+        return f"{flask.request.endpoint}:ok"
+
+    app.register_blueprint(bp, url_prefix="/v1", name="api_v1")
+    app.register_blueprint(bp, url_prefix="/v2", name="api_v2")
+
+    # Each registration's error handler is scoped to its own routes.
+    assert client.get("/v1/fail").data == b"api_v1.fail:forbidden"
+    assert client.get("/v2/fail").data == b"api_v2.fail:forbidden"
+    assert client.get("/v1/ok").data == b"api_v1.ok:ok"
+    assert client.get("/v2/ok").data == b"api_v2.ok:ok"
+
+
+def test_multiple_registration_subdomain_isolation(app, client):
+    """Registering the same blueprint with different subdomains should
+    keep subdomain routing independent between registrations.
+    """
+    app.subdomain_matching = True
+    app.config["SERVER_NAME"] = "example.test"
+    client.allow_subdomain_redirects = True
+
+    bp = flask.Blueprint("api", __name__)
+
+    @bp.route("/")
+    def index():
+        return flask.request.endpoint
+
+    app.register_blueprint(bp, url_prefix="/api", name="api_v1", subdomain="v1")
+    app.register_blueprint(bp, url_prefix="/api", name="api_v2", subdomain="v2")
+
+    rv = client.get("/api/", base_url="http://v1.example.test")
+    assert rv.data == b"api_v1.index"
+
+    rv = client.get("/api/", base_url="http://v2.example.test")
+    assert rv.data == b"api_v2.index"
+
+    # Wrong subdomain returns 404.
+    rv = client.get("/api/", base_url="http://v2.example.test")
+    assert rv.status_code == 200
+
+
+def test_nested_multiple_registration_isolation(app, client):
+    """When the same parent blueprint is registered multiple times with
+    different names, all nested child and grandchild blueprints should
+    preserve their own endpoint prefix, url_prefix and error handler
+    mapping under each parent registration.
+    """
+    parent = flask.Blueprint("parent", __name__)
+    child = flask.Blueprint("child", __name__)
+    grandchild = flask.Blueprint("grandchild", __name__)
+
+    @parent.route("/")
+    def parent_index():
+        return flask.request.endpoint
+
+    @parent.errorhandler(403)
+    def parent_forbidden(e):
+        return f"{flask.request.endpoint}:parent_forbidden", 403
+
+    @parent.route("/no")
+    def parent_no():
+        flask.abort(403)
+
+    @child.route("/")
+    def child_index():
+        return flask.request.endpoint
+
+    @child.route("/no")
+    def child_no():
+        flask.abort(403)
+
+    @grandchild.route("/")
+    def grandchild_index():
+        return flask.request.endpoint
+
+    @grandchild.errorhandler(403)
+    def grandchild_forbidden(e):
+        return f"{flask.request.endpoint}:grandchild_forbidden", 403
+
+    @grandchild.route("/no")
+    def grandchild_no():
+        flask.abort(403)
+
+    child.register_blueprint(grandchild, url_prefix="/grandchild")
+    parent.register_blueprint(child, url_prefix="/child")
+
+    app.register_blueprint(parent, url_prefix="/p1", name="p1")
+    app.register_blueprint(parent, url_prefix="/p2", name="p2")
+
+    # URL routing: each registration has its own URL hierarchy.
+    assert client.get("/p1/").data == b"p1.parent_index"
+    assert client.get("/p2/").data == b"p2.parent_index"
+    assert client.get("/p1/child/").data == b"p1.child.child_index"
+    assert client.get("/p2/child/").data == b"p2.child.child_index"
+    assert (
+        client.get("/p1/child/grandchild/").data
+        == b"p1.child.grandchild.grandchild_index"
+    )
+    assert (
+        client.get("/p2/child/grandchild/").data
+        == b"p2.child.grandchild.grandchild_index"
+    )
+
+    # Error handler scoping: parent handles child's 403, grandchild has
+    # its own handler. Both registrations behave independently.
+    assert client.get("/p1/no").data == b"p1.parent_no:parent_forbidden"
+    assert client.get("/p2/no").data == b"p2.parent_no:parent_forbidden"
+    assert client.get("/p1/child/no").data == b"p1.child.child_no:parent_forbidden"
+    assert client.get("/p2/child/no").data == b"p2.child.child_no:parent_forbidden"
+    assert (
+        client.get("/p1/child/grandchild/no").data
+        == b"p1.child.grandchild.grandchild_no:grandchild_forbidden"
+    )
+    assert (
+        client.get("/p2/child/grandchild/no").data
+        == b"p2.child.grandchild.grandchild_no:grandchild_forbidden"
+    )
+
+    # url_for: each endpoint resolves to the correct registration's URL.
+    with app.test_request_context():
+        assert flask.url_for("p1.parent_index") == "/p1/"
+        assert flask.url_for("p2.parent_index") == "/p2/"
+        assert flask.url_for("p1.child.child_index") == "/p1/child/"
+        assert flask.url_for("p2.child.child_index") == "/p2/child/"
+        assert (
+            flask.url_for("p1.child.grandchild.grandchild_index")
+            == "/p1/child/grandchild/"
+        )
+        assert (
+            flask.url_for("p2.child.grandchild.grandchild_index")
+            == "/p2/child/grandchild/"
+        )
+
+
+def test_nested_shared_child_different_parents(app, client):
+    """The same child blueprint object can be registered under different
+    parent blueprints. Each parent registration should produce an
+    independent endpoint hierarchy with correct prefixes and error
+    handler scoping.
+    """
+    parent1 = flask.Blueprint("parent1", __name__)
+    parent2 = flask.Blueprint("parent2", __name__)
+    shared_child = flask.Blueprint("shared", __name__)
+
+    @shared_child.route("/")
+    def shared_index():
+        return flask.request.endpoint
+
+    @shared_child.errorhandler(404)
+    def shared_not_found(e):
+        return f"{flask.request.endpoint}:custom_404", 404
+
+    @shared_child.route("/missing")
+    def shared_missing():
+        flask.abort(404)
+
+    parent1.register_blueprint(shared_child, url_prefix="/shared")
+    parent2.register_blueprint(shared_child, url_prefix="/shared")
+
+    app.register_blueprint(parent1, url_prefix="/a")
+    app.register_blueprint(parent2, url_prefix="/b")
+
+    # Each parent gets its own child endpoints.
+    assert client.get("/a/shared/").data == b"parent1.shared.shared_index"
+    assert client.get("/b/shared/").data == b"parent2.shared.shared_index"
+
+    # Error handlers are scoped to each registration.
+    assert client.get("/a/shared/missing").data == b"parent1.shared.shared_missing:custom_404"
+    assert client.get("/b/shared/missing").data == b"parent2.shared.shared_missing:custom_404"
+
+    # url_for builds correctly for each registration.
+    with app.test_request_context():
+        assert flask.url_for("parent1.shared.shared_index") == "/a/shared/"
+        assert flask.url_for("parent2.shared.shared_index") == "/b/shared/"
+
+
+def test_multiple_registration_before_request_isolation(app, client):
+    """before_request functions on a blueprint registered multiple times
+    should fire only for the matching registration's routes.
+    """
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.before_request
+    def tag_request():
+        flask.g.bp_name = flask.request.blueprints[0]
+
+    @bp.route("/")
+    def index():
+        return flask.g.get("bp_name", "none")
+
+    app.register_blueprint(bp, url_prefix="/a", name="bp_a")
+    app.register_blueprint(bp, url_prefix="/b", name="bp_b")
+
+    assert client.get("/a/").data == b"bp_a"
+    assert client.get("/b/").data == b"bp_b"
+
+
+def test_multiple_registration_url_defaults_isolation(app, client):
+    """url_defaults from different registrations of the same blueprint
+    should be independent and applied only to the correct registration's
+    routes.
+    """
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.route("/page")
+    def page(version):
+        return f"v{version}"
+
+    app.register_blueprint(
+        bp, url_prefix="/v1", name="bp_v1", url_defaults={"version": 1}
+    )
+    app.register_blueprint(
+        bp, url_prefix="/v2", name="bp_v2", url_defaults={"version": 2}
+    )
+
+    assert client.get("/v1/page").data == b"v1"
+    assert client.get("/v2/page").data == b"v2"
+
+
+def test_multiple_registration_cli_no_mutation(app):
+    """Registering the same blueprint multiple times should not mutate
+    the blueprint's CLI group object.
+    """
+    bp = flask.Blueprint("bp", __name__)
+
+    import click
+
+    @bp.cli.command("hello")
+    def hello_cmd():
+        click.echo("hello")
+
+    original_cli_name = bp.cli.name
+
+    app.register_blueprint(bp, name="first")
+    # The blueprint's CLI group name should not be mutated.
+    assert bp.cli.name == original_cli_name
+
+    app.register_blueprint(bp, name="second")
+    # Still not mutated after second registration.
+    assert bp.cli.name == original_cli_name
+
+
+def test_error_handler_spec_not_shared_between_registrations(app):
+    """The error_handler_spec entries for different registrations of the
+    same blueprint should be independent dict objects, not shared
+    references.
+    """
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.errorhandler(403)
+    def forbidden(e):
+        return "forbidden", 403
+
+    app.register_blueprint(bp, url_prefix="/a", name="bp_a")
+    app.register_blueprint(bp, url_prefix="/b", name="bp_b")
+
+    spec_a = app.error_handler_spec["bp_a"]
+    spec_b = app.error_handler_spec["bp_b"]
+
+    # They are separate objects.
+    assert spec_a is not spec_b
+
+    # Inner code dicts are also separate objects.
+    assert spec_a[403] is not spec_b[403]

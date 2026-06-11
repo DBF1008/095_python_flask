@@ -304,12 +304,23 @@ class Blueprint(Scaffold):
         name = f"{name_prefix}.{self_name}".lstrip(".")
 
         if name in app.blueprints:
-            bp_desc = "this" if app.blueprints[name] is self else "a different"
+            if app.blueprints[name] is not self:
+                # A different blueprint object is already registered with
+                # this name. This is always an error.
+                existing_at = f" '{name}'" if self_name != name else ""
+
+                raise ValueError(
+                    f"The name '{self_name}' is already registered for"
+                    f" a different blueprint{existing_at}. Use 'name=' to"
+                    f" provide a unique name."
+                )
+            # Same blueprint object re-registered with the same full name.
+            # This is also an error; use ``name=`` to differentiate.
             existing_at = f" '{name}'" if self_name != name else ""
 
             raise ValueError(
                 f"The name '{self_name}' is already registered for"
-                f" {bp_desc} blueprint{existing_at}. Use 'name=' to"
+                f" this blueprint{existing_at}. Use 'name=' to"
                 f" provide a unique name."
             )
 
@@ -334,17 +345,18 @@ class Blueprint(Scaffold):
         for deferred in self.deferred_functions:
             deferred(state)
 
-        cli_resolved_group = options.get("cli_group", self.cli_group)
+        # Only register CLI commands on the first time this blueprint
+        # object is registered, to avoid duplicating commands and to
+        # avoid mutating the shared ``self.cli`` group object.
+        if first_bp_registration and self.cli.commands:
+            cli_resolved_group = options.get("cli_group", self.cli_group)
 
-        if self.cli.commands:
             if cli_resolved_group is None:
                 app.cli.commands.update(self.cli.commands)
             elif cli_resolved_group is _sentinel:
-                self.cli.name = name
-                app.cli.add_command(self.cli)
+                app.cli.add_command(self.cli, name=name)
             else:
-                self.cli.name = cli_resolved_group
-                app.cli.add_command(self.cli)
+                app.cli.add_command(self.cli, name=cli_resolved_group)
 
         for blueprint, bp_options in self._blueprints:
             bp_options = bp_options.copy()
@@ -387,10 +399,13 @@ class Blueprint(Scaffold):
 
         for key, value in self.error_handler_spec.items():
             key = name if key is None else f"{name}.{key}"
+            # Deep-copy each inner code→handler dict so that different
+            # registrations of the same blueprint never share mutable
+            # state through ``app.error_handler_spec``.
             value = defaultdict(
                 dict,
                 {
-                    code: {exc_class: func for exc_class, func in code_values.items()}
+                    code: dict(code_values)
                     for code, code_values in value.items()
                 },
             )
