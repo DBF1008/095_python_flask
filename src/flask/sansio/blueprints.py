@@ -387,14 +387,8 @@ class Blueprint(Scaffold):
 
         for key, value in self.error_handler_spec.items():
             key = name if key is None else f"{name}.{key}"
-            value = defaultdict(
-                dict,
-                {
-                    code: {exc_class: func for exc_class, func in code_values.items()}
-                    for code, code_values in value.items()
-                },
-            )
-            app.error_handler_spec[key] = value
+            for code, code_values in value.items():
+                app.error_handler_spec[key][code].update(code_values)
 
         for endpoint, func in self.view_functions.items():
             app.view_functions[endpoint] = func

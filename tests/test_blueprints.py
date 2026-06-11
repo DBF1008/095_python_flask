@@ -1116,3 +1116,194 @@ def test_blueprint_renaming(app, client) -> None:
     assert client.get("/b/a/").data == b"alt.sub.index2"
     assert client.get("/a/error").data == b"Error"
     assert client.get("/b/error").data == b"Error"
+
+
+def test_multi_registration_url_for_isolation(app, client) -> None:
+    """url_for with relative endpoints resolves to the correct
+    registration's url_prefix, not the first registration."""
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.route("/")
+    def index():
+        return flask.url_for(".index")
+
+    app.register_blueprint(bp, url_prefix="/v1")
+    app.register_blueprint(bp, url_prefix="/v2", name="v2")
+
+    assert client.get("/v1/").data == b"/v1/"
+    assert client.get("/v2/").data == b"/v2/"
+
+
+def test_multi_registration_error_handler_isolation(app, client) -> None:
+    """Error handlers dispatch correctly for each registration."""
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.errorhandler(403)
+    def handle_403(e):
+        return "bp-level forbidden", 403
+
+    @bp.route("/denied")
+    def denied():
+        flask.abort(403)
+
+    app.register_blueprint(bp, url_prefix="/v1")
+    app.register_blueprint(bp, url_prefix="/v2", name="v2")
+
+    r1 = client.get("/v1/denied")
+    r2 = client.get("/v2/denied")
+    assert r1.status_code == 403
+    assert r2.status_code == 403
+    assert r1.data == b"bp-level forbidden"
+    assert r2.data == b"bp-level forbidden"
+
+
+def test_multi_registration_url_defaults_isolation(app, client) -> None:
+    """url_defaults passed at registration time are isolated per
+    registration."""
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.route("/")
+    def index(version):
+        return version
+
+    app.register_blueprint(
+        bp, url_prefix="/v1", url_defaults={"version": "1.0"}
+    )
+    app.register_blueprint(
+        bp, url_prefix="/v2", name="v2", url_defaults={"version": "2.0"}
+    )
+
+    assert client.get("/v1/").data == b"1.0"
+    assert client.get("/v2/").data == b"2.0"
+
+
+def test_multi_registration_nested_url_for(app, client) -> None:
+    """url_for in nested blueprints resolves correctly across
+    multiple registrations of the parent."""
+    parent = flask.Blueprint("parent", __name__)
+    child = flask.Blueprint("child", __name__)
+
+    @child.route("/")
+    def child_index():
+        return flask.url_for(".child_index")
+
+    parent.register_blueprint(child, url_prefix="/child")
+    app.register_blueprint(parent, url_prefix="/a")
+    app.register_blueprint(parent, url_prefix="/b", name="alt")
+
+    assert client.get("/a/child/").data == b"/a/child/"
+    assert client.get("/b/child/").data == b"/b/child/"
+
+
+def test_multi_registration_nested_error_handler(app, client) -> None:
+    """Error handler dispatch in nested blueprints works correctly
+    for each registration of the parent, including handler
+    inheritance from parent to child."""
+    parent = flask.Blueprint("parent", __name__)
+    child = flask.Blueprint("child", __name__)
+
+    @parent.errorhandler(403)
+    def parent_403(e):
+        return "parent-forbidden", 403
+
+    @child.route("/")
+    def child_index():
+        flask.abort(403)
+
+    parent.register_blueprint(child, url_prefix="/child")
+    app.register_blueprint(parent, url_prefix="/a")
+    app.register_blueprint(parent, url_prefix="/b", name="alt")
+
+    r1 = client.get("/a/child/")
+    r2 = client.get("/b/child/")
+    assert r1.status_code == 403
+    assert r2.status_code == 403
+    assert r1.data == b"parent-forbidden"
+    assert r2.data == b"parent-forbidden"
+
+
+def test_multi_registration_subdomain_isolation(app, client) -> None:
+    """Subdomain settings are properly isolated per registration."""
+    app.subdomain_matching = True
+    app.config["SERVER_NAME"] = "example.test"
+    client.allow_subdomain_redirects = True
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.route("/")
+    def index():
+        return flask.request.endpoint
+
+    app.register_blueprint(bp, subdomain="api")
+    app.register_blueprint(bp, subdomain="admin", name="admin_bp")
+
+    r1 = client.get("/", base_url="http://api.example.test")
+    r2 = client.get("/", base_url="http://admin.example.test")
+    assert r1.data == b"bp.index"
+    assert r2.data == b"admin_bp.index"
+
+
+def test_multi_registration_callback_isolation(app, client) -> None:
+    """before_request callbacks are scoped to their registration."""
+    bp = flask.Blueprint("bp", __name__)
+    seen: list[str] = []
+
+    @bp.before_request
+    def track():
+        seen.append(flask.request.endpoint)
+
+    @bp.route("/")
+    def index():
+        return "ok"
+
+    app.register_blueprint(bp, url_prefix="/v1")
+    app.register_blueprint(bp, url_prefix="/v2", name="v2")
+
+    seen.clear()
+    client.get("/v1/")
+    assert seen == ["bp.index"]
+
+    seen.clear()
+    client.get("/v2/")
+    assert seen == ["v2.index"]
+
+
+def test_multi_registration_url_value_preprocessor_isolation(app, client) -> None:
+    """url_value_preprocessor and url_defaults are scoped to their
+    registration."""
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.url_defaults
+    def add_version(endpoint, values):
+        values.setdefault("version", "default")
+
+    @bp.url_value_preprocessor
+    def pull_version(endpoint, values):
+        flask.g.version = values.pop("version")
+
+    @bp.route("/<version>/")
+    def index():
+        return flask.g.version
+
+    app.register_blueprint(bp, url_prefix="/v1")
+    app.register_blueprint(bp, url_prefix="/v2", name="v2")
+
+    assert client.get("/v1/latest/").data == b"latest"
+    assert client.get("/v2/stable/").data == b"stable"
+
+
+def test_multi_registration_endpoint_decorator(app, client) -> None:
+    """@bp.endpoint() with absolute endpoint names still works
+    correctly after multi-registration (backward compat)."""
+    from werkzeug.routing import Rule
+
+    app.url_map.add(Rule("/global", endpoint="global_ep"))
+    bp = flask.Blueprint("bp", __name__)
+
+    @bp.endpoint("global_ep")
+    def global_view():
+        return "global"
+
+    app.register_blueprint(bp, url_prefix="/a")
+    app.register_blueprint(bp, url_prefix="/b", name="alt")
+
+    assert client.get("/global").data == b"global"
