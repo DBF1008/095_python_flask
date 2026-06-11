@@ -660,6 +660,91 @@ class App(Scaffold):
                 )
             self.view_functions[endpoint] = view_func
 
+    def list_routes(self) -> list[dict[str, t.Any]]:
+        """Return a structured snapshot of all registered URL routes.
+
+        Each entry is a dictionary with the following keys:
+
+        ``endpoint``
+            The endpoint name string.
+
+        ``methods``
+            A sorted list of all HTTP method strings for the rule,
+            including automatically added ``HEAD`` and ``OPTIONS``.
+
+        ``rule``
+            The URL rule string (e.g. ``/users/<int:id>``).
+
+        ``host``
+            The host constraint, or ``None``.
+
+        ``subdomain``
+            The subdomain constraint, or ``None``.
+
+        ``defaults``
+            A dictionary of URL default values, or ``None``.
+
+        ``websocket``
+            ``True`` if the rule is a WebSocket route.
+
+        ``blueprint``
+            The name of the blueprint the route belongs to (including
+            dotted path for nested blueprints), or ``None`` for routes
+            registered directly on the app.
+
+        ``arguments``
+            A set of URL variable names used in the rule.
+
+        This provides a single source of truth used by both the
+        ``flask routes`` CLI command and programmatic consumers (e.g.
+        test clients or diagnostic tooling).
+
+        .. versionadded:: 3.2
+        """
+        # Build a set of all registered blueprint names for fast lookup.
+        bp_names = set(self.blueprints)
+
+        result: list[dict[str, t.Any]] = []
+
+        for rule in self.url_map.iter_rules():
+            # Determine the blueprint this endpoint belongs to by finding
+            # the longest registered blueprint name that is a prefix of the
+            # endpoint.  Blueprint endpoints are separated by dots, so
+            # "parent.child.view" → blueprint is "parent.child".
+            endpoint = rule.endpoint
+            blueprint_name: str | None = None
+
+            if "." in endpoint:
+                parts = endpoint.rsplit(".", 1)
+                candidate = parts[0]
+                # Walk up the dotted path to find the longest matching
+                # blueprint name.  This handles nested blueprints.
+                while candidate:
+                    if candidate in bp_names:
+                        blueprint_name = candidate
+                        break
+                    if "." not in candidate:
+                        break
+                    candidate = candidate.rsplit(".", 1)[0]
+
+            methods = sorted(rule.methods or set())
+
+            result.append(
+                {
+                    "endpoint": endpoint,
+                    "methods": methods,
+                    "rule": rule.rule,
+                    "host": rule.host or None,
+                    "subdomain": rule.subdomain or None,
+                    "defaults": dict(rule.defaults) if rule.defaults else None,
+                    "websocket": rule.websocket,
+                    "blueprint": blueprint_name,
+                    "arguments": set(rule.arguments) if rule.arguments else set(),
+                }
+            )
+
+        return result
+
     @t.overload
     def template_filter(self, name: T_template_filter) -> T_template_filter: ...
     @t.overload

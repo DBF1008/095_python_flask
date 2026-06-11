@@ -105,6 +105,7 @@ default-groups = ["dev", "pre-commit", "tests", "typing"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 filterwarnings = [
     "error",
 ]

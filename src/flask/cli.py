@@ -1060,27 +1060,31 @@ def shell_command() -> None:
 @with_appcontext
 def routes_command(sort: str, all_methods: bool) -> None:
     """Show all registered routes with endpoints and methods."""
-    rules = list(current_app.url_map.iter_rules())
+    routes = current_app.list_routes()
 
-    if not rules:
+    if not routes:
         click.echo("No routes were registered.")
         return
 
     ignored_methods = set() if all_methods else {"HEAD", "OPTIONS"}
     host_matching = current_app.url_map.host_matching
-    has_domain = any(rule.host if host_matching else rule.subdomain for rule in rules)
+    has_domain = any(
+        (r["host"] if host_matching else r["subdomain"]) for r in routes
+    )
     rows = []
 
-    for rule in rules:
+    for route in routes:
         row = [
-            rule.endpoint,
-            ", ".join(sorted((rule.methods or set()) - ignored_methods)),
+            route["endpoint"],
+            ", ".join(sorted(set(route["methods"]) - ignored_methods)),
         ]
 
         if has_domain:
-            row.append((rule.host if host_matching else rule.subdomain) or "")
+            row.append(
+                (route["host"] if host_matching else route["subdomain"]) or ""
+            )
 
-        row.append(rule.rule)
+        row.append(route["rule"])
         rows.append(row)
 
     headers = ["Endpoint", "Methods"]
