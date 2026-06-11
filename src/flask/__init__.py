@@ -30,6 +30,7 @@ from .signals import message_flashed as message_flashed
 from .signals import request_finished as request_finished
 from .signals import request_started as request_started
 from .signals import request_tearing_down as request_tearing_down
+from .signals import response_instrumented as response_instrumented
 from .signals import template_rendered as template_rendered
 from .templating import render_template as render_template
 from .templating import render_template_string as render_template_string

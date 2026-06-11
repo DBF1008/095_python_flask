@@ -49,6 +49,7 @@ from .signals import got_request_exception
 from .signals import request_finished
 from .signals import request_started
 from .signals import request_tearing_down
+from .signals import response_instrumented
 from .templating import Environment
 from .wrappers import Request
 from .wrappers import Response
@@ -1415,7 +1416,82 @@ class Flask(App):
         if not self.session_interface.is_null_session(ctx._get_session()):
             self.session_interface.save_session(self, ctx._get_session(), response)
 
+        metadata = self.collect_response_metadata(ctx, response)
+        response_instrumented.send(
+            self, _async_wrapper=self.ensure_sync, metadata=metadata, response=response
+        )
+
         return response
+
+    def collect_response_metadata(
+        self, ctx: AppContext, response: Response
+    ) -> dict[str, t.Any]:
+        """Build a metadata dictionary summarising the outgoing response.
+        This is called by :meth:`process_response` after all
+        :meth:`after_request` functions have run and the session has been
+        saved, so the metadata reflects the *final* state of the response.
+
+        The default implementation collects:
+
+        ``json``
+            If the response ``Content-Type`` is ``application/json``,
+            provides ``content_length`` (byte length of the response body)
+            and ``is_well_formed`` (whether the body can be parsed back as
+            valid JSON).
+
+        ``session``
+            ``cookie_set`` -- whether a ``Set-Cookie`` header for the
+            session cookie name is present in the response.
+            ``modified`` -- whether the session object reports being
+            modified.
+            ``accessed`` -- whether the session was accessed during the
+            request.
+            ``null_session`` -- whether the session is a null (unusable)
+            session.
+
+        ``vary``
+            ``values`` -- the final sorted list of values in the ``Vary``
+            response header.
+
+        Override this method to add custom fields or to change the
+        collected data.  The returned dictionary is passed as the
+        ``metadata`` keyword argument to the
+        :data:`~flask.signals.response_instrumented` signal.
+
+        .. versionadded:: 3.2
+        """
+        metadata: dict[str, t.Any] = {}
+
+        # -- JSON body info ------------------------------------------------
+        content_type = response.content_type or ""
+        if "application/json" in content_type:
+            body = response.get_data()
+            is_well_formed = True
+            try:
+                self.json.loads(body)
+            except Exception:
+                is_well_formed = False
+            metadata["json"] = {
+                "content_length": len(body),
+                "is_well_formed": is_well_formed,
+            }
+
+        # -- Session cookie write-back info ----------------------------------
+        sess = ctx._get_session()
+        cookie_name = self.session_interface.get_cookie_name(self)
+        set_cookie_header = response.headers.get("Set-Cookie", "")
+        metadata["session"] = {
+            "cookie_set": cookie_name in set_cookie_header,
+            "modified": getattr(sess, "modified", False),
+            "accessed": getattr(sess, "accessed", False),
+            "null_session": self.session_interface.is_null_session(sess),
+        }
+
+        # -- Vary header info -----------------------------------------------
+        vary_values = sorted(response.vary)
+        metadata["vary"] = {"values": vary_values}
+
+        return metadata
 
     def do_teardown_request(
         self, ctx: AppContext, exc: BaseException | None = None
