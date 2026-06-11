@@ -247,3 +247,252 @@ def test_session_dynamic_cookie_name():
     # cookies are being used for the urls that end with "dynamic cookie"
     assert test_client.get("/get").data == b"42"
     assert test_client.get("/get_dynamic_cookie").data == b"616"
+
+
+def test_copy_session_isolation(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """Child session modifications must not leak to the parent's session
+    or affect the parent response's Set-Cookie header.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=1)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+
+    @app.route("/")
+    def index():
+        flask.session["parent_key"] = "parent_value"
+
+        @flask.copy_current_request_context
+        def work():
+            # Child reads parent's data.
+            assert flask.session["parent_key"] == "parent_value"
+            # Child modifies its own session snapshot.
+            flask.session["child_key"] = "child_value"
+            return "done"
+
+        future = executor.submit(work)
+        future.result(timeout=5)
+        return "OK"
+
+    rv = client.get("/")
+    assert rv.text == "OK"
+
+    # Parent response should NOT contain the child's session modification.
+    with client.session_transaction() as sess:
+        assert sess.get("parent_key") == "parent_value"
+        assert "child_key" not in sess
+
+
+def test_copy_session_vary_cookie_stable(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """Vary: Cookie must be set when the parent accesses the session,
+    regardless of whether the child also accesses it.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=1)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+
+    @app.route("/")
+    def index():
+        # Parent accesses session (sets accessed=True on parent's session).
+        _ = flask.session.get("anything")
+
+        @flask.copy_current_request_context
+        def work():
+            # Child also accesses session (sets accessed=True on child's snapshot).
+            flask.session.get("something")
+            return "done"
+
+        future = executor.submit(work)
+        future.result(timeout=5)
+        return "OK"
+
+    rv = client.get("/")
+    assert "Cookie" in rv.headers.get("Vary", "")
+
+
+def test_copy_g_isolation(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """Child g starts with a snapshot of parent's g values. Child modifications
+    do not affect the parent's g.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=1)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+    parent_g_after = {}
+
+    @app.route("/")
+    def index():
+        flask.g.parent_data = "from_parent"
+
+        @flask.copy_current_request_context
+        def work():
+            # Child can read parent's g.
+            assert flask.g.parent_data == "from_parent"
+            # Child modifies its own g.
+            flask.g.child_data = "from_child"
+            # Child's override does not propagate to parent.
+            flask.g.parent_data = "overridden_by_child"
+            return "done"
+
+        future = executor.submit(work)
+        future.result(timeout=5)
+
+        # Parent g is unaffected by child's writes.
+        parent_g_after["parent_data"] = flask.g.parent_data
+        parent_g_after["has_child_data"] = hasattr(flask.g, "child_data")
+        return "OK"
+
+    rv = client.get("/")
+    assert rv.text == "OK"
+    assert parent_g_after["parent_data"] == "from_parent"
+    assert parent_g_after["has_child_data"] is False
+
+
+def test_copy_teardown_runs_once(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """Teardown callbacks must only fire once — when the parent context is
+    popped — not when the child's copied context is popped.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=2)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+    teardown_calls: list = []
+    app_teardown_calls: list = []
+
+    @app.teardown_request
+    def on_teardown(exc):
+        teardown_calls.append(exc)
+
+    @app.teardown_appcontext
+    def on_app_teardown(exc):
+        app_teardown_calls.append(exc)
+
+    @app.route("/")
+    def index():
+        @flask.copy_current_request_context
+        def work(n):
+            # The child context is pushed and will be popped here.
+            assert flask.request.path == "/"
+            return n
+
+        results = list(executor.map(work, range(5)))
+        assert results == list(range(5))
+        return "OK"
+
+    rv = client.get("/")
+    assert rv.text == "OK"
+
+    # teardown_request fires exactly once, not 1 + 5 times.
+    assert len(teardown_calls) == 1
+    assert len(app_teardown_calls) == 1
+
+
+def test_copy_request_body_cached(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """The request body must be pre-cached so the child thread can safely
+    read it without racing on the WSGI input stream.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=1)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+
+    @app.route("/", methods=["POST"])
+    def index():
+        # Parent does NOT read the body first.
+
+        @flask.copy_current_request_context
+        def work():
+            # Child reads the body — should work because the wrapper
+            # pre-cached it before the child thread started.
+            return flask.request.get_data(as_text=True)
+
+        future = executor.submit(work)
+        return future.result(timeout=5)
+
+    rv = client.post("/", data="hello world")
+    assert rv.text == "hello world"
+
+
+def test_copy_multiple_threads_no_cross_contamination(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """Multiple concurrent copied contexts must each see the correct parent
+    data without any cross-contamination between threads.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=5)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+
+    @app.route("/")
+    def index():
+        flask.session["shared"] = "original"
+        flask.g.shared = "original"
+
+        @flask.copy_current_request_context
+        def work(n):
+            # Each task sees the parent's snapshot.
+            assert flask.session["shared"] == "original"
+            assert flask.g.shared == "original"
+
+            # Each task modifies its own copy.
+            flask.session["shared"] = f"child_{n}"
+            flask.g.shared = f"child_{n}"
+
+            # Modifications are visible within this task.
+            assert flask.session["shared"] == f"child_{n}"
+            assert flask.g.shared == f"child_{n}"
+            return n
+
+        results = list(executor.map(work, range(20)))
+        assert sorted(results) == list(range(20))
+
+        # Parent session and g are unaffected by any child modifications.
+        assert flask.session["shared"] == "original"
+        assert flask.g.shared == "original"
+        return "OK"
+
+    rv = client.get("/")
+    assert rv.text == "OK"
+
+
+def test_copy_parent_session_dirty_state_isolated(
+    request: pytest.FixtureRequest, app: flask.Flask, client: FlaskClient
+) -> None:
+    """Multiple child modifications must not accumulate on the parent session,
+    even when the child reads, writes, and deletes session keys.
+    """
+    executor = futures.ThreadPoolExecutor(max_workers=1)
+    request.addfinalizer(lambda: executor.shutdown(cancel_futures=True))
+
+    @app.route("/")
+    def index():
+        flask.session["keep"] = "keep_value"
+        flask.session["to_delete"] = "will_be_deleted"
+
+        @flask.copy_current_request_context
+        def work():
+            # Child reads parent data.
+            assert flask.session["keep"] == "keep_value"
+            assert flask.session["to_delete"] == "will_be_deleted"
+
+            # Child modifies extensively.
+            flask.session["keep"] = "changed_by_child"
+            del flask.session["to_delete"]
+            flask.session["new_from_child"] = "child_data"
+            flask.session["another_child_key"] = "another_value"
+
+            return "done"
+
+        future = executor.submit(work)
+        future.result(timeout=5)
+        return "OK"
+
+    rv = client.get("/")
+    assert rv.text == "OK"
+
+    # Parent session is completely unaffected by child's modifications.
+    with client.session_transaction() as sess:
+        assert sess.get("keep") == "keep_value"
+        assert sess.get("to_delete") == "will_be_deleted"
+        assert "new_from_child" not in sess
+        assert "another_child_key" not in sess

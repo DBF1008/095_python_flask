@@ -152,25 +152,23 @@ F = t.TypeVar("F", bound=t.Callable[..., t.Any])
 
 
 def copy_current_request_context(f: F) -> F:
-    """Decorate a function to run inside the current request context. This can
-    be used when starting a background task, otherwise it will not see the app
-    and request objects that were active in the parent.
+    """Decorate a function to run inside a copy of the current request context.
+    This can be used when starting a background task, otherwise it will not see
+    the app and request objects that were active in the parent.
 
-    .. warning::
+    The copied context provides the following isolation guarantees:
 
-        Due to the following caveats, it is often safer (and simpler) to pass
-        the data you need when starting the task, rather than using this and
-        relying on the context objects.
-
-    In order to avoid execution switching partially though reading data, either
-    read the request body (access ``form``, ``json``, ``data``, etc) before
-    starting the task, or use a lock. This can be an issue when using threading,
-    but shouldn't be an issue when using greenlet/gevent or asyncio.
-
-    If the task will access ``session``, be sure to do so in the parent as well
-    so that the ``Vary: cookie`` header will be set. Modifying ``session`` in
-    the task should be avoided, as it may execute after the response cookie has
-    already been written.
+    -   The ``session`` is snapshotted. Reads and writes in the task do not
+        affect the parent's session data, ``Vary: Cookie`` header, or
+        ``Set-Cookie`` response header.
+    -   The ``g`` object is snapshotted. The task can read values set by the
+        parent, but writes do not affect the parent's ``g``.
+    -   The request body is pre-cached before the task starts, so reading
+        ``request.data``, ``request.json``, or ``request.form`` in the task
+        will not race with the parent on the WSGI input stream.
+    -   Teardown callbacks (``teardown_request``, ``teardown_appcontext``) and
+        related signals only fire when the parent context is popped, not when
+        the task's copied context is popped.
 
     .. code-block:: python
 
@@ -181,11 +179,14 @@ def copy_current_request_context(f: F) -> F:
         def index():
             @copy_current_request_context
             def do_some_work():
-                # do some work here, it can access flask.request or
-                # flask.session like you would otherwise in the view function.
+                # can access flask.request, flask.session, flask.g
                 ...
             gevent.spawn(do_some_work)
             return 'Regular response'
+
+    .. versionchanged:: 3.2
+        Session, ``g``, and request body are isolated. Teardown only runs on
+        the parent context.
 
     .. versionadded:: 0.10
     """
@@ -199,6 +200,13 @@ def copy_current_request_context(f: F) -> F:
         )
 
     def wrapper(*args: t.Any, **kwargs: t.Any) -> t.Any:
+        # Pre-cache the request body in the current thread before the task
+        # runs, so the WSGI input stream is fully consumed and stored in the
+        # request's internal cache. This avoids a race between the parent
+        # thread and the worker thread on the shared input stream.
+        if original._request is not None:
+            original._request.get_data(cache=True)
+
         # Copy the context before pushing, so each worker acts independently.
         with original.copy() as ctx:
             return ctx.app.ensure_sync(f)(*args, **kwargs)
@@ -336,6 +344,12 @@ class AppContext:
         original push has been popped.
         """
 
+        self._is_copy: bool = False
+        """True if this context was created by :meth:`copy`. Copied contexts
+        skip teardown callbacks and signals on pop, leaving cleanup to the
+        original context.
+        """
+
     @classmethod
     def from_environ(cls, app: Flask, environ: WSGIEnvironment, /) -> te.Self:
         """Create an app context with request data from the given WSGI environ.
@@ -353,19 +367,49 @@ class AppContext:
         return self._request is not None
 
     def copy(self) -> te.Self:
-        """Create a new context with the same data objects as this context. See
-        :func:`.copy_current_request_context`.
+        """Create a new context with isolated copies of the session and ``g``
+        data. Used by :func:`copy_current_request_context` to run background
+        tasks with access to the current request.
+
+        The session is snapshotted so that reads and writes in the copied
+        context do not affect the parent context's session, ``Vary: Cookie``
+        header, or ``Set-Cookie`` response. The ``g`` object is also
+        snapshotted so the child can read parent values without sharing
+        mutable state.
+
+        .. versionchanged:: 3.2
+            The session and ``g`` are isolated from the parent context.
 
         .. versionchanged:: 1.1
-            The current session data is used instead of reloading the original data.
+            The current session data is used instead of reloading the original
+            data.
 
         .. versionadded:: 0.10
         """
-        return self.__class__(
+        # Snapshot the session so child reads/writes don't affect the parent's
+        # Vary: Cookie header, Set-Cookie, or session data.
+        session_copy = None
+
+        if self._session is not None:
+            session_copy = type(self._session)()
+            session_copy.update(self._session)
+            # update() triggers on_update (modified=True), so override after.
+            session_copy.modified = self._session.modified
+            session_copy.accessed = self._session.accessed
+            session_copy.new = self._session.new
+
+        ctx = self.__class__(
             self.app,
             request=self._request,
-            session=self._session,
+            session=session_copy,
         )
+
+        # Snapshot g so the child can read parent's values without sharing
+        # mutable state. Child writes don't affect the parent's g.
+        ctx.g.__dict__.update(self.g.__dict__)
+
+        ctx._is_copy = True
+        return ctx
 
     @property
     def request(self) -> Request:
@@ -481,6 +525,14 @@ class AppContext:
         self._push_count -= 1
 
         if self._push_count > 0:
+            return
+
+        # Copied contexts (from copy_current_request_context) skip teardown
+        # callbacks, request close, and signals. The parent context is
+        # responsible for all cleanup when it pops.
+        if self._is_copy:
+            _cv_app.reset(self._cv_token)
+            self._cv_token = None
             return
 
         collect_errors = _CollectErrors()
