@@ -34,6 +34,28 @@ if t.TYPE_CHECKING:
     from .app import Flask
 
 
+# Tracks environment variables set by load_dotenv and their original values
+# before load_dotenv first modified them. Used to undo dotenv changes between
+# CLI invocations so that consecutive calls don't pollute each other.
+_dotenv_set_keys: dict[str, str | None] = {}
+
+
+def _reset_dotenv_state() -> None:
+    """Remove env vars that were set by a previous :func:`load_dotenv` call
+    and restore their original values. Called at the start of ``load_dotenv``
+    and by :class:`FlaskGroup` to ensure each CLI invocation starts clean.
+
+    .. versionadded:: 3.2
+    """
+    for key, original in _dotenv_set_keys.items():
+        if original is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original
+
+    _dotenv_set_keys.clear()
+
+
 class NoAppException(click.UsageError):
     """Raised if an application cannot be found or loaded."""
 
@@ -661,6 +683,12 @@ class FlaskGroup(AppGroup):
         parent: click.Context | None = None,
         **extra: t.Any,
     ) -> click.Context:
+        # Snapshot os.environ *before* parse_args triggers load_dotenv.
+        # This lets invoke() undo all dotenv and flag side-effects when
+        # the command finishes, so consecutive CLI invocations don't see
+        # stale env state from a previous run.
+        env_snapshot = dict(os.environ)
+
         # Set a flag to tell app.run to become a no-op. If app.run was
         # not in a __name__ == __main__ guard, it would start the server
         # when importing, blocking whatever command is being called.
@@ -673,7 +701,31 @@ class FlaskGroup(AppGroup):
                 load_dotenv_defaults=self.load_dotenv,
             )
 
-        return super().make_context(info_name, args, parent=parent, **extra)
+        ctx = super().make_context(info_name, args, parent=parent, **extra)
+        ctx._flask_env_snapshot = env_snapshot  # type: ignore[attr-defined]
+        return ctx
+
+    def invoke(self, ctx: click.Context) -> t.Any:
+        try:
+            return super().invoke(ctx)
+        finally:
+            env_snapshot: dict[str, str] = getattr(
+                ctx, "_flask_env_snapshot", {}
+            )
+
+            # Remove env vars that were added during this invocation
+            # (by load_dotenv, --debug, etc.) but weren't in the
+            # original environment.
+            for key in list(os.environ):
+                if key not in env_snapshot:
+                    del os.environ[key]
+
+            # Restore env vars to their pre-invocation values.  This
+            # undoes changes from load_dotenv, the --debug flag, and
+            # any other side-effects on os.environ.
+            for key, value in env_snapshot.items():
+                if os.environ.get(key) != value:
+                    os.environ[key] = value
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         if (not args and self.no_args_is_help) or (
@@ -703,6 +755,11 @@ def load_dotenv(
     loading and combining these files, values are only set if the key is not
     already set in ``os.environ``.
 
+    Values set by a previous call to ``load_dotenv`` are cleared before
+    loading, so consecutive calls with different files do not pollute each
+    other. The original ``os.environ`` values (from the user's shell) are
+    preserved.
+
     This is a no-op if `python-dotenv`_ is not installed.
 
     .. _python-dotenv: https://github.com/theskumar/python-dotenv#readme
@@ -711,6 +768,9 @@ def load_dotenv(
     :param load_defaults: Search for and load the default ``.flaskenv`` and
         ``.env`` files.
     :return: ``True`` if at least one env var was loaded.
+
+    .. versionchanged:: 3.2
+        Values set by a previous call are cleared before loading new files.
 
     .. versionchanged:: 3.1
         Added the ``load_defaults`` parameter. A given path takes precedence
@@ -742,6 +802,11 @@ def load_dotenv(
 
         return False
 
+    # Clear values set by a previous load_dotenv call so that a new
+    # invocation (e.g. a second ``flask`` command in the same process)
+    # does not see stale values from a different env file.
+    _reset_dotenv_state()
+
     data: dict[str, str | None] = {}
 
     if load_defaults:
@@ -755,10 +820,19 @@ def load_dotenv(
         data |= dotenv.dotenv_values(path, encoding="utf-8")
 
     for key, value in data.items():
-        if key in os.environ or value is None:
+        if value is None:
             continue
 
-        os.environ[key] = value
+        # Only set the variable if it is not already in os.environ.
+        # os.environ here reflects the user's shell (previous dotenv
+        # values were cleared above).
+        if key not in os.environ:
+            # Remember the original value so we can restore it later.
+            # Only record on first sight so we keep the true original.
+            if key not in _dotenv_set_keys:
+                _dotenv_set_keys[key] = os.environ.get(key)
+
+            os.environ[key] = value
 
     return bool(data)  # True if at least one env var was loaded.
 

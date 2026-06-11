@@ -701,3 +701,217 @@ def test_cli_empty(app):
 def test_run_exclude_patterns():
     ctx = run_command.make_context("run", ["--exclude-patterns", __file__])
     assert ctx.params["exclude_patterns"] == [__file__]
+
+
+# ---------------------------------------------------------------------------
+# Tests for env-file loading / isolation across consecutive invocations
+# ---------------------------------------------------------------------------
+
+
+@need_dotenv
+class TestDotenvIsolation:
+    """Verify that env-file loading and ScriptInfo app resolution behave
+    correctly when the CLI is invoked multiple times in the same process.
+    """
+
+    def test_consecutive_env_files(self, runner, monkeypatch, test_apps):
+        """Running the CLI twice with different --env-file values should
+        pick up the correct values each time — the second invocation must
+        NOT see stale values from the first.
+        """
+        for item in ("MY_VAR",):
+            monkeypatch._setitem.append((os.environ, item, notset))
+
+        monkeypatch.chdir(test_path)
+
+        cli = FlaskGroup(
+            create_app=lambda: Flask("test"),
+            add_default_commands=False,
+        )
+
+        @cli.command()
+        def show():
+            click.echo(os.environ.get("MY_VAR", "unset"))
+
+        # First invocation with env_a.env → MY_VAR=from_a
+        result_a = runner.invoke(cli, ["--env-file", str(test_path / "env_a.env"), "show"])
+        assert result_a.exit_code == 0
+        assert result_a.output.strip() == "from_a"
+
+        # Second invocation with env_b.env → MY_VAR=from_b
+        result_b = runner.invoke(cli, ["--env-file", str(test_path / "env_b.env"), "show"])
+        assert result_b.exit_code == 0
+        assert result_b.output.strip() == "from_b"
+
+    def test_env_cleanup_after_invocation(self, runner, monkeypatch, test_apps):
+        """After a CLI invocation finishes, the env vars it loaded from
+        dotenv files must be removed from os.environ.
+        """
+        for item in ("MY_VAR", "FLASK_APP"):
+            monkeypatch._setitem.append((os.environ, item, notset))
+
+        monkeypatch.chdir(test_path)
+
+        cli = FlaskGroup(add_default_commands=False)
+
+        @cli.command()
+        def noop():
+            click.echo("ok")
+
+        runner.invoke(cli, ["--env-file", str(test_path / "env_a.env"), "noop"])
+
+        # MY_VAR was only set by the env file, should be cleaned up.
+        assert "MY_VAR" not in os.environ
+
+    def test_explicit_env_file_overrides_defaults(self, runner, monkeypatch):
+        """An explicit --env-file should take precedence over the default
+        .env and .flaskenv files for the same keys.
+        """
+        for item in ("FOO", "MY_VAR"):
+            monkeypatch._setitem.append((os.environ, item, notset))
+
+        monkeypatch.chdir(test_path)
+
+        cli = FlaskGroup(add_default_commands=False)
+
+        @cli.command()
+        def show():
+            click.echo(os.environ.get("MY_VAR", "unset"))
+            click.echo(os.environ.get("FOO", "unset"))
+
+        # env_a.env has MY_VAR=from_a; .env and .flaskenv have FOO
+        result = runner.invoke(cli, ["--env-file", str(test_path / "env_a.env"), "show"])
+        assert result.exit_code == 0
+        lines = result.output.strip().splitlines()
+        assert lines[0] == "from_a"
+        # FOO comes from .env (which takes precedence over .flaskenv)
+        assert lines[1] == "env"
+
+    def test_user_env_vars_not_overwritten(self, runner, monkeypatch):
+        """Variables already set in os.environ (by the user's shell) must
+        not be overwritten by any dotenv file.
+        """
+        monkeypatch.setenv("MY_VAR", "from_shell")
+        monkeypatch.chdir(test_path)
+
+        cli = FlaskGroup(add_default_commands=False)
+
+        @cli.command()
+        def show():
+            click.echo(os.environ.get("MY_VAR", "unset"))
+
+        result = runner.invoke(cli, ["--env-file", str(test_path / "env_a.env"), "show"])
+        assert result.exit_code == 0
+        # The shell value must win over the env file.
+        assert result.output.strip() == "from_shell"
+
+    def test_help_and_execution_consistent(self, runner, monkeypatch, test_apps):
+        """The --help path and the actual execution path should load the
+        same environment variables.  Previously, the help path processed
+        eager options differently, which could lead to inconsistent state.
+        """
+        for item in ("MY_VAR",):
+            monkeypatch._setitem.append((os.environ, item, notset))
+
+        monkeypatch.chdir(test_path)
+
+        def create_app():
+            name = os.environ.get("MY_VAR", "default")
+            app = Flask(name)
+
+            @app.cli.command()
+            def hello():
+                click.echo(f"hello from {current_app.name}")
+
+            return app
+
+        cli = FlaskGroup(create_app=create_app, add_default_commands=False)
+
+        # Help path — the app's custom command should appear in help output
+        # because the env file sets FLASK_APP and MY_VAR.
+        result_help = runner.invoke(
+            cli, ["--env-file", str(test_path / "env_a.env"), "--help"]
+        )
+        assert result_help.exit_code == 0
+
+        # Execution path
+        result_exec = runner.invoke(
+            cli, ["--env-file", str(test_path / "env_a.env"), "hello"]
+        )
+        assert result_exec.exit_code == 0
+        assert "hello from from_a" in result_exec.output
+
+    def test_scriptinfo_no_cache_leak_across_contexts(self, test_apps, monkeypatch):
+        """Each FlaskGroup.make_context creates a fresh ScriptInfo, so the
+        _loaded_app cache from one invocation cannot leak into the next.
+        """
+        monkeypatch.chdir(test_path)
+
+        cli = FlaskGroup(add_default_commands=False)
+
+        ctx1 = cli.make_context("flask", ["--app", "cliapp.app:testapp"])
+        info1 = ctx1.ensure_object(ScriptInfo)
+        app1 = info1.load_app()
+        assert app1.name == "testapp"
+
+        ctx2 = cli.make_context("flask", ["--app", "cliapp.factory:create_app"])
+        info2 = ctx2.ensure_object(ScriptInfo)
+        app2 = info2.load_app()
+        assert app2.name == "app"
+
+        # The two ScriptInfo objects are independent.
+        assert info1 is not info2
+        assert app1 is not app2
+
+    @need_dotenv
+    def test_load_dotenv_clears_previous(self, monkeypatch):
+        """Calling load_dotenv twice with different files should give the
+        second file's values, not the first file's stale values.
+        """
+        for item in ("MY_VAR", "FOO", "BAR", "SPAM", "HAM"):
+            monkeypatch._setitem.append((os.environ, item, notset))
+
+        monkeypatch.chdir(test_path)
+
+        # First call loads defaults (.flaskenv + .env)
+        load_dotenv()
+        assert os.environ["FOO"] == "env"
+        assert os.environ["BAR"] == "bar"
+
+        # Second call with explicit file should override
+        load_dotenv(test_path / "env_b.env", load_defaults=False)
+        assert os.environ["MY_VAR"] == "from_b"
+        # FOO was only in the defaults, not in env_b.env — should be cleared.
+        assert "FOO" not in os.environ
+        assert "BAR" not in os.environ
+
+    def test_debug_flag_cleaned_up(self, runner, monkeypatch):
+        """The --debug flag sets FLASK_DEBUG in os.environ.  After the
+        invocation finishes, this must be cleaned up so subsequent
+        invocations are not affected.
+        """
+        for item in ("FLASK_DEBUG",):
+            monkeypatch._setitem.append((os.environ, item, notset))
+
+        cli = FlaskGroup(
+            create_app=lambda: Flask("test"),
+            add_default_commands=False,
+        )
+
+        @cli.command()
+        def show_debug():
+            click.echo(os.environ.get("FLASK_DEBUG", "unset"))
+
+        # Invocation with --debug
+        result = runner.invoke(cli, ["--debug", "show_debug"])
+        assert result.exit_code == 0
+        assert result.output.strip() == "1"
+
+        # FLASK_DEBUG should be cleaned up after the invocation.
+        assert "FLASK_DEBUG" not in os.environ
+
+        # Invocation without --debug
+        result = runner.invoke(cli, ["show_debug"])
+        assert result.exit_code == 0
+        assert result.output.strip() == "unset"
+
