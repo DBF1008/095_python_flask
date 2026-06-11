@@ -310,7 +310,7 @@ class ScriptInfo:
         load_dotenv_defaults: bool = True,
     ) -> None:
         #: Optionally the import path for the Flask application.
-        self.app_import_path = app_import_path
+        self._app_import_path = app_import_path
         #: Optionally a function that is passed the script info to create
         #: the instance of the application.
         self.create_app = create_app
@@ -329,6 +329,17 @@ class ScriptInfo:
         """
 
         self._loaded_app: Flask | None = None
+
+    @property
+    def app_import_path(self) -> str | None:
+        """The import path for the Flask application."""
+        return self._app_import_path
+
+    @app_import_path.setter
+    def app_import_path(self, value: str | None) -> None:
+        if value != self._app_import_path:
+            self._app_import_path = value
+            self._loaded_app = None
 
     def load_app(self) -> Flask:
         """Loads the Flask app (if not yet loaded) and returns it.  Calling
@@ -679,13 +690,31 @@ class FlaskGroup(AppGroup):
         if (not args and self.no_args_is_help) or (
             len(args) == 1 and args[0] in self.get_help_option_names(ctx)
         ):
-            # Attempt to load --env-file and --app early in case they
-            # were given as env vars. Otherwise no_args_is_help will not
-            # see commands from app.cli.
-            _env_file_option.handle_parse_result(ctx, {}, [])
-            _app_option.handle_parse_result(ctx, {}, [])
+            # Load env files and resolve FLASK_APP early so that
+            # list_commands() can discover app-registered commands
+            # during help formatting.  Use direct calls instead of
+            # handle_parse_result to avoid double callback invocation
+            # when super().parse_args() processes these eager options
+            # again through Click's normal flow.
+            info = ctx.ensure_object(ScriptInfo)
+            env_file_path = os.environ.get("FLASK_ENV_FILE")
+
+            if env_file_path is not None or info.load_dotenv_defaults:
+                load_dotenv(env_file_path, load_defaults=info.load_dotenv_defaults)
+
+            app_path = os.environ.get("FLASK_APP")
+
+            if app_path is not None and info.app_import_path is None:
+                info.app_import_path = app_path
 
         return super().parse_args(ctx, args)
+
+
+_dotenv_loaded_keys: set[str] = set()
+"""Tracks environment variable keys set by :func:`load_dotenv` so they can
+be cleaned up on the next call, preventing stale values from persisting
+across repeated invocations in the same process.
+"""
 
 
 def _path_is_ancestor(path: str, other: str) -> bool:
@@ -742,6 +771,14 @@ def load_dotenv(
 
         return False
 
+    # Clear keys set by a previous load_dotenv call so that repeated
+    # invocations (e.g. help then execute, or consecutive CLI runner
+    # calls) start with a clean slate and don't block new values.
+    for key in _dotenv_loaded_keys:
+        os.environ.pop(key, None)
+
+    _dotenv_loaded_keys.clear()
+
     data: dict[str, str | None] = {}
 
     if load_defaults:
@@ -759,6 +796,7 @@ def load_dotenv(
             continue
 
         os.environ[key] = value
+        _dotenv_loaded_keys.add(key)
 
     return bool(data)  # True if at least one env var was loaded.
 

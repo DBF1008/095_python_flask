@@ -5,6 +5,7 @@ import pytest
 from _pytest import monkeypatch
 
 from flask import Flask
+from flask.cli import _dotenv_loaded_keys
 from flask.globals import app_ctx as _app_ctx
 
 
@@ -39,6 +40,16 @@ def _reset_os_environ(monkeypatch, _standard_os_environ):
     in case a test changed something without cleaning up.
     """
     monkeypatch._setitem.extend(_standard_os_environ)
+
+
+@pytest.fixture(autouse=True)
+def _reset_dotenv_tracking():
+    """Clear the dotenv key tracking set after each test so that keys
+    loaded in one test don't get cleaned up at the start of the next
+    test's ``load_dotenv`` call.
+    """
+    yield
+    _dotenv_loaded_keys.clear()
 
 
 @pytest.fixture
