@@ -57,6 +57,7 @@ if t.TYPE_CHECKING:  # pragma: no cover
     from _typeshed.wsgi import StartResponse
     from _typeshed.wsgi import WSGIEnvironment
 
+    from .ctx_tracker import ContextTracker
     from .testing import FlaskClient
     from .testing import FlaskCliRunner
     from .typing import HeadersValue
@@ -342,6 +343,8 @@ class Flask(App):
         # Set the name of the Click group in case someone wants to add
         # the app's commands to another CLI tool.
         self.cli.name = self.name
+
+        self._context_tracker: ContextTracker | None = None
 
         # Add a static route using the provided static_url_path, static_host,
         # and static_folder if there is a configured static_folder.
@@ -1477,6 +1480,38 @@ class Flask(App):
             appcontext_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
 
         collect_errors.raise_any("Errors during app teardown")
+
+    @property
+    def context_tracker(self) -> ContextTracker | None:
+        """The context lifecycle tracker, or ``None`` if tracking is
+        not enabled. Call :meth:`enable_context_tracking` to enable.
+
+        .. versionadded:: 3.2
+        """
+        return self._context_tracker
+
+    def enable_context_tracking(self) -> ContextTracker:
+        """Enable tracking of context push/pop/copy lifecycle events.
+        Returns the :class:`~flask.ctx_tracker.ContextTracker` instance.
+
+        This captures stack traces on every context operation and should
+        only be used for debugging, not in production.
+
+        .. versionadded:: 3.2
+        """
+        from .ctx_tracker import ContextTracker
+
+        if self._context_tracker is None:
+            self._context_tracker = ContextTracker()
+
+        return self._context_tracker
+
+    def disable_context_tracking(self) -> None:
+        """Disable context lifecycle tracking and discard recorded data.
+
+        .. versionadded:: 3.2
+        """
+        self._context_tracker = None
 
     def app_context(self) -> AppContext:
         """Create an :class:`.AppContext`. When the context is pushed,

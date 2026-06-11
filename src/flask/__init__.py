@@ -3,6 +3,9 @@ from .app import Flask as Flask
 from .blueprints import Blueprint as Blueprint
 from .config import Config as Config
 from .ctx import after_this_request as after_this_request
+from .ctx_tracker import ContextEvent as ContextEvent
+from .ctx_tracker import ContextLeakWarning as ContextLeakWarning
+from .ctx_tracker import ContextTracker as ContextTracker
 from .ctx import copy_current_request_context as copy_current_request_context
 from .ctx import has_app_context as has_app_context
 from .ctx import has_request_context as has_request_context

@@ -361,11 +361,16 @@ class AppContext:
 
         .. versionadded:: 0.10
         """
-        return self.__class__(
+        new_ctx = self.__class__(
             self.app,
             request=self._request,
             session=self._session,
         )
+
+        if self.app._context_tracker is not None:
+            self.app._context_tracker.record_copy(self, new_ctx)
+
+        return new_ctx
 
     @property
     def request(self) -> Request:
@@ -431,6 +436,10 @@ class AppContext:
             return
 
         self._cv_token = _cv_app.set(self)
+
+        if self.app._context_tracker is not None:
+            self.app._context_tracker.record_push(self)
+
         appcontext_pushed.send(self.app, _async_wrapper=self.app.ensure_sync)
 
         if self._request is not None:
@@ -494,6 +503,9 @@ class AppContext:
 
         with collect_errors:
             self.app.do_teardown_appcontext(self, exc)
+
+        if self.app._context_tracker is not None:
+            self.app._context_tracker.record_pop(self)
 
         _cv_app.reset(self._cv_token)
         self._cv_token = None
