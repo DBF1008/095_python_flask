@@ -1,6 +1,7 @@
 # This file was part of Flask-CLI and was modified under the terms of
 # its Revised BSD License. Copyright © 2015 CERN.
 import importlib.metadata
+import json
 import os
 import platform
 import ssl
@@ -517,6 +518,180 @@ class TestRoutes:
         result = runner.invoke(cli, ["routes"])
         assert result.exit_code == 0
         assert "Host" in result.output
+
+    def test_json_format(self, app, invoke):
+        result = invoke(["routes", "--format", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert isinstance(data, list)
+        assert len(data) > 0
+        expected_keys = {
+            "endpoint",
+            "rule",
+            "methods",
+            "blueprint",
+            "host",
+            "subdomain",
+            "websocket",
+            "defaults",
+            "arguments",
+            "view_function",
+        }
+        for entry in data:
+            assert set(entry.keys()) == expected_keys
+            assert isinstance(entry["methods"], list)
+            assert isinstance(entry["websocket"], bool)
+
+    def test_json_format_blueprint(self, runner):
+        app = Flask(__name__, static_folder=None)
+        bp = Blueprint("auth", __name__)
+
+        @bp.route("/login")
+        def login():
+            return "login"
+
+        app.register_blueprint(bp, url_prefix="/auth")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        login_route = [r for r in data if r["endpoint"] == "auth.login"]
+        assert len(login_route) == 1
+        assert login_route[0]["blueprint"] == "auth"
+        assert login_route[0]["rule"] == "/auth/login"
+
+    def test_json_format_nested_blueprint(self, runner):
+        app = Flask(__name__, static_folder=None)
+        parent = Blueprint("parent", __name__)
+        child = Blueprint("child", __name__)
+        grandchild = Blueprint("grandchild", __name__)
+
+        @parent.route("/")
+        def parent_index():
+            return "parent"
+
+        @child.route("/")
+        def child_index():
+            return "child"
+
+        @grandchild.route("/")
+        def grandchild_index():
+            return "grandchild"
+
+        child.register_blueprint(grandchild, url_prefix="/grandchild")
+        parent.register_blueprint(child, url_prefix="/child")
+        app.register_blueprint(parent, url_prefix="/parent")
+
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+
+        by_ep = {r["endpoint"]: r for r in data}
+        assert by_ep["parent.parent_index"]["blueprint"] == "parent"
+        assert by_ep["parent.parent_index"]["rule"] == "/parent/"
+
+        assert by_ep["parent.child.child_index"]["blueprint"] == "parent.child"
+        assert by_ep["parent.child.child_index"]["rule"] == "/parent/child/"
+
+        gc = by_ep["parent.child.grandchild.grandchild_index"]
+        assert gc["blueprint"] == "parent.child.grandchild"
+        assert gc["rule"] == "/parent/child/grandchild/"
+
+    def test_json_format_subdomain(self, runner):
+        app = Flask(__name__, static_folder=None)
+        app.add_url_rule("/a", subdomain="api", endpoint="a")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        route_a = [r for r in data if r["endpoint"] == "a"][0]
+        assert route_a["subdomain"] == "api"
+
+    def test_json_format_host(self, runner):
+        app = Flask(__name__, static_folder=None, host_matching=True)
+        app.add_url_rule("/a", host="example.com", endpoint="a")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        route_a = [r for r in data if r["endpoint"] == "a"][0]
+        assert route_a["host"] == "example.com"
+        assert route_a["subdomain"] is None
+
+    def test_json_format_websocket(self, runner):
+        app = Flask(__name__, static_folder=None)
+        app.add_url_rule("/ws", endpoint="ws", websocket=True)
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        ws_route = [r for r in data if r["endpoint"] == "ws"][0]
+        assert ws_route["websocket"] is True
+
+    def test_json_format_url_defaults(self, runner):
+        app = Flask(__name__, static_folder=None)
+        app.add_url_rule(
+            "/items",
+            endpoint="items",
+            defaults={"page": 1},
+        )
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        route = [r for r in data if r["endpoint"] == "items"][0]
+        assert route["defaults"] == {"page": 1}
+
+    def test_json_format_duplicate_registration(self, runner):
+        app = Flask(__name__, static_folder=None)
+        bp = Blueprint("section", __name__)
+
+        @bp.route("/")
+        def index():
+            return "index"
+
+        app.register_blueprint(bp, url_prefix="/v1", name="section_v1")
+        app.register_blueprint(bp, url_prefix="/v2", name="section_v2")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+
+        v1 = [r for r in data if r["endpoint"] == "section_v1.index"]
+        v2 = [r for r in data if r["endpoint"] == "section_v2.index"]
+        assert len(v1) == 1
+        assert v1[0]["rule"] == "/v1/"
+        assert v1[0]["blueprint"] == "section_v1"
+        assert len(v2) == 1
+        assert v2[0]["rule"] == "/v2/"
+        assert v2[0]["blueprint"] == "section_v2"
+
+    def test_snapshot_matches_cli(self, runner):
+        app = Flask(__name__, static_folder=None)
+        bp = Blueprint("api", __name__)
+
+        @bp.route("/users")
+        def users():
+            return "users"
+
+        app.register_blueprint(bp, url_prefix="/api")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes", "-f", "json"])
+        cli_data = json.loads(result.output)
+
+        with app.app_context():
+            snapshot_data = app.get_route_snapshot()
+
+        assert cli_data == snapshot_data
+
+    def test_existing_table_format_unchanged(self, invoke):
+        result_default = invoke(["routes"])
+        result_table = invoke(["routes", "--format", "table"])
+        assert result_default.output == result_table.output
+        assert "Endpoint" in result_default.output
+        assert "Methods" in result_default.output
+        assert "Rule" in result_default.output
 
 
 def dotenv_not_available():

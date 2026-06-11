@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import collections.abc as cabc
 import importlib.metadata
 import inspect
@@ -1057,9 +1058,21 @@ def shell_command() -> None:
     ),
 )
 @click.option("--all-methods", is_flag=True, help="Show HEAD and OPTIONS methods.")
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(("table", "json")),
+    default="table",
+    help="Output format. 'json' gives a structured snapshot of every route.",
+)
 @with_appcontext
-def routes_command(sort: str, all_methods: bool) -> None:
+def routes_command(sort: str, all_methods: bool, output_format: str) -> None:
     """Show all registered routes with endpoints and methods."""
+    if output_format == "json":
+        click.echo(json.dumps(current_app.get_route_snapshot(), indent=2))
+        return
+
     rules = list(current_app.url_map.iter_rules())
 
     if not rules:

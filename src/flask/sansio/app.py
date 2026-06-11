@@ -601,6 +601,52 @@ class App(Scaffold):
         """
         return self.blueprints.values()
 
+    def get_route_snapshot(self) -> list[dict[str, t.Any]]:
+        """Return a structured snapshot of all registered routes.
+
+        Each entry is a dict with keys: ``endpoint``, ``rule``, ``methods``,
+        ``blueprint``, ``host``, ``subdomain``, ``websocket``, ``defaults``,
+        ``arguments``, and ``view_function``.
+
+        The same data is available via ``flask routes --format json``.
+
+        .. versionadded:: 3.2
+        """
+        # Pre-sort blueprint names longest-first for correct nested matching.
+        bp_names = sorted(self.blueprints, key=len, reverse=True)
+        snapshot: list[dict[str, t.Any]] = []
+
+        for rule in self.url_map.iter_rules():
+            endpoint = rule.endpoint
+
+            # Determine originating blueprint by longest-prefix match.
+            blueprint: str | None = None
+            for name in bp_names:
+                if endpoint.startswith(f"{name}."):
+                    blueprint = name
+                    break
+
+            view_func = self.view_functions.get(endpoint)
+
+            snapshot.append(
+                {
+                    "endpoint": endpoint,
+                    "rule": rule.rule,
+                    "methods": sorted(rule.methods or set()),
+                    "blueprint": blueprint,
+                    "host": rule.host if rule.host else None,
+                    "subdomain": rule.subdomain if rule.subdomain else None,
+                    "websocket": rule.websocket,
+                    "defaults": dict(rule.defaults) if rule.defaults else None,
+                    "arguments": sorted(rule.arguments),
+                    "view_function": (
+                        view_func.__name__ if view_func is not None else None
+                    ),
+                }
+            )
+
+        return snapshot
+
     @setupmethod
     def add_url_rule(
         self,
