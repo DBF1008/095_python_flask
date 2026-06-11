@@ -167,10 +167,10 @@ def copy_current_request_context(f: F) -> F:
     starting the task, or use a lock. This can be an issue when using threading,
     but shouldn't be an issue when using greenlet/gevent or asyncio.
 
-    If the task will access ``session``, be sure to do so in the parent as well
-    so that the ``Vary: cookie`` header will be set. Modifying ``session`` in
-    the task should be avoided, as it may execute after the response cookie has
-    already been written.
+    The ``session`` data is snapshot-copied into the child context so that
+    reads in the child do not affect the parent's ``Vary: Cookie`` header.
+    Modifying ``session`` in the task should still be avoided, as the response
+    cookie is written by the parent context.
 
     .. code-block:: python
 
@@ -187,6 +187,11 @@ def copy_current_request_context(f: F) -> F:
             gevent.spawn(do_some_work)
             return 'Regular response'
 
+    .. versionchanged:: 3.2
+        Session data is snapshot-copied.  The parent's session is eagerly
+        accessed so ``Vary: Cookie`` is always set on the response.  The
+        request body is cached to prevent stream races in threaded tasks.
+
     .. versionadded:: 0.10
     """
     # Store the context that was active when the decorator was applied.
@@ -197,6 +202,16 @@ def copy_current_request_context(f: F) -> F:
             "'copy_current_request_context' can only be used when a"
             " request context is active, such as in a view function."
         )
+
+    # Eagerly access the session in the parent context so that:
+    # 1. Vary: Cookie is reliably set on the parent response.
+    # 2. The session data is available for snapshotting in copy().
+    if original._request is not None:
+        original.session  # sets accessed = True on the parent session
+
+        # Cache the request body so that concurrent reads in child
+        # tasks don't race on the underlying WSGI input stream.
+        original._request.get_data(cache=True)
 
     def wrapper(*args: t.Any, **kwargs: t.Any) -> t.Any:
         # Copy the context before pushing, so each worker acts independently.
@@ -336,6 +351,13 @@ class AppContext:
         original push has been popped.
         """
 
+        self._is_copy: bool = False
+        """True if this context was created by :meth:`copy`. A copied context
+        shares the request object with the original but owns an independent
+        session snapshot and ``g``.  On teardown the shared request is **not**
+        closed, because the original context owns that lifecycle.
+        """
+
     @classmethod
     def from_environ(cls, app: Flask, environ: WSGIEnvironment, /) -> te.Self:
         """Create an app context with request data from the given WSGI environ.
@@ -353,19 +375,62 @@ class AppContext:
         return self._request is not None
 
     def copy(self) -> te.Self:
-        """Create a new context with the same data objects as this context. See
+        """Create a new context with the same request but an independent
+        session snapshot and a fresh ``g`` object.  See
         :func:`.copy_current_request_context`.
+
+        The session is shallow-copied so that the child context can read
+        session data without affecting the parent's ``Vary: Cookie`` or
+        ``modified`` flags.  The request object is shared (read-only for
+        the child); callers should cache the request body before copying
+        to avoid stream races.
+
+        The returned context is marked as a copy so that
+        :meth:`pop` will **not** call ``request.close()``—that
+        responsibility stays with the original context.
+
+        .. versionchanged:: 3.2
+            Session data is now snapshot-copied instead of shared by reference.
+            The copied context no longer closes the shared request on teardown.
 
         .. versionchanged:: 1.1
             The current session data is used instead of reloading the original data.
 
         .. versionadded:: 0.10
         """
-        return self.__class__(
+        ctx = self.__class__(
             self.app,
             request=self._request,
-            session=self._session,
+            session=self._snapshot_session(),
         )
+        ctx._is_copy = True
+        return ctx
+
+    def _snapshot_session(self) -> SessionMixin | None:
+        """Create an independent shallow copy of the current session.
+
+        The copy carries over the ``accessed`` and ``new`` flags so the
+        child starts in the same logical state, but subsequent reads or
+        writes in the child will not affect the parent's session object.
+        """
+        if self._session is None:
+            return None
+
+        src = self._session
+
+        # Construct a new instance of the same session class with a copy
+        # of the data.  SecureCookieSession (and most subclasses) accept
+        # an ``initial`` mapping in __init__.
+        try:
+            snapshot: SessionMixin = type(src)(dict(src))
+        except TypeError:
+            import copy as _copy_mod
+
+            snapshot = _copy_mod.copy(src)
+
+        snapshot.accessed = src.accessed
+        snapshot.new = src.new
+        return snapshot
 
     @property
     def request(self) -> Request:
@@ -489,8 +554,11 @@ class AppContext:
             with collect_errors:
                 self.app.do_teardown_request(self, exc)
 
-            with collect_errors:
-                self._request.close()
+            # A copied context shares the request object with the
+            # original.  Only the original context should close it.
+            if not self._is_copy:
+                with collect_errors:
+                    self._request.close()
 
         with collect_errors:
             self.app.do_teardown_appcontext(self, exc)

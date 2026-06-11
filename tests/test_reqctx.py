@@ -247,3 +247,260 @@ def test_session_dynamic_cookie_name():
     # cookies are being used for the urls that end with "dynamic cookie"
     assert test_client.get("/get").data == b"42"
     assert test_client.get("/get_dynamic_cookie").data == b"616"
+
+
+class TestCopyContextIsolation:
+    """Tests for copy_current_request_context ensuring proper isolation
+    between parent and child contexts across threads."""
+
+    def test_session_snapshot_isolation(self, app, client):
+        """Modifying session in a child task must not affect the parent."""
+        parent_session_after = {}
+
+        @app.route("/")
+        def index():
+            flask.session["key"] = "parent_value"
+
+            @flask.copy_current_request_context
+            def child():
+                # Child sees the snapshot of the parent's session data.
+                assert flask.session["key"] == "parent_value"
+                # Mutating in the child must not leak back.
+                flask.session["key"] = "child_value"
+                flask.session["child_only"] = True
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            future.result()
+            executor.shutdown()
+
+            # Parent session is unaffected.
+            parent_session_after["key"] = flask.session["key"]
+            parent_session_after["has_child_only"] = "child_only" in flask.session
+            return "ok"
+
+        client.get("/")
+        assert parent_session_after["key"] == "parent_value"
+        assert parent_session_after["has_child_only"] is False
+
+    def test_vary_cookie_always_set(self, app, client):
+        """Vary: Cookie must appear on the response even if only the child
+        accesses session, because copy_current_request_context eagerly
+        accesses the parent session."""
+
+        @app.route("/")
+        def index():
+            # Deliberately do NOT access session here in the view body.
+            @flask.copy_current_request_context
+            def child():
+                _ = flask.session.get("anything")
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            future.result()
+            executor.shutdown()
+            return "ok"
+
+        app.secret_key = "test-secret"
+        rv = client.get("/")
+        # The decorator eagerly touched the parent session, so Vary is set.
+        assert "Cookie" in rv.headers.get("Vary", "")
+
+    def test_g_isolation(self, app, client):
+        """Each copied context must have its own independent g object."""
+        results = {}
+
+        @app.route("/")
+        def index():
+            flask.g.parent_val = "parent"
+
+            @flask.copy_current_request_context
+            def child():
+                # Child gets a fresh g — parent_val should not exist.
+                assert not hasattr(flask.g, "parent_val")
+                flask.g.child_val = "child"
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            future.result()
+            executor.shutdown()
+
+            results["parent_val"] = flask.g.parent_val
+            results["has_child_val"] = hasattr(flask.g, "child_val")
+            return "ok"
+
+        client.get("/")
+        assert results["parent_val"] == "parent"
+        assert results["has_child_val"] is False
+
+    def test_teardown_runs_in_child(self, app, client):
+        """Teardown functions must fire in both parent and child contexts."""
+        teardown_log = []
+
+        @app.teardown_request
+        def log_teardown(exc):
+            import threading
+
+            teardown_log.append(threading.current_thread().name)
+
+        @app.route("/")
+        def index():
+            @flask.copy_current_request_context
+            def child():
+                pass  # Teardown fires when the copied context pops.
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            future.result()
+            executor.shutdown()
+            return "ok"
+
+        client.get("/")
+        # One teardown from the child thread, one from the main thread.
+        assert len(teardown_log) == 2
+
+    def test_request_close_skipped_in_child(self, app, client):
+        """request.close() must only be called by the original context,
+        not by the copied child context."""
+        close_count = 0
+
+        class TrackingRequest(flask.Request):
+            def close(self):
+                nonlocal close_count
+                close_count += 1
+                super().close()
+
+        app.request_class = TrackingRequest
+
+        @app.route("/")
+        def index():
+            @flask.copy_current_request_context
+            def child():
+                # Just access request to prove the context is alive.
+                _ = flask.request.path
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            future.result()
+            executor.shutdown()
+            return "ok"
+
+        client.get("/")
+        # close() should have been called exactly once (by the parent).
+        assert close_count == 1
+
+    def test_no_cross_request_leaking_threaded(self, app, client):
+        """Concurrent requests using copy_current_request_context must not
+        leak state across request boundaries."""
+        import threading
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        @app.route("/<label>")
+        def index(label):
+            flask.session["label"] = label
+            flask.g.label = label
+
+            @flask.copy_current_request_context
+            def child():
+                barrier.wait()  # Force both children to run concurrently.
+                return {
+                    "session_label": flask.session["label"],
+                    "request_path": flask.request.path,
+                }
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            result = future.result()
+            executor.shutdown()
+            return flask.jsonify(result)
+
+        app.secret_key = "test-secret"
+
+        results = {}
+
+        def do_request(label):
+            with app.test_client() as c:
+                rv = c.get(f"/{label}")
+                results[label] = rv.get_json()
+
+        t1 = threading.Thread(target=do_request, args=("alpha",))
+        t2 = threading.Thread(target=do_request, args=("beta",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert results["alpha"]["session_label"] == "alpha"
+        assert results["alpha"]["request_path"] == "/alpha"
+        assert results["beta"]["session_label"] == "beta"
+        assert results["beta"]["request_path"] == "/beta"
+
+    def test_body_cached_before_copy(self, app, client):
+        """The request body must be cached before the context is copied,
+        so child tasks can read form/json/data without stream races."""
+
+        @app.route("/", methods=["POST"])
+        def index():
+            @flask.copy_current_request_context
+            def child():
+                # Should be able to read the body even though the parent
+                # already consumed the stream (it was cached).
+                return flask.request.get_json()
+
+            executor = futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(child)
+            result = future.result()
+            executor.shutdown()
+            return flask.jsonify(result)
+
+        rv = client.post(
+            "/",
+            json={"msg": "hello"},
+        )
+        assert rv.get_json() == {"msg": "hello"}
+
+    def test_copy_is_copy_flag(self, app):
+        """The _is_copy flag must be set on copied contexts only."""
+        with app.test_request_context("/"):
+            from flask.globals import _cv_app
+
+            original = _cv_app.get()
+            assert original._is_copy is False
+
+            copy = original.copy()
+            assert copy._is_copy is True
+
+    def test_multiple_children_independent_sessions(self, app, client):
+        """Multiple children from the same parent must each get their own
+        independent session snapshot."""
+
+        @app.route("/")
+        def index():
+            flask.session["counter"] = 0
+
+            results = []
+
+            for i in range(3):
+
+                @flask.copy_current_request_context
+                def child(n=i):
+                    flask.session["counter"] += 1
+                    return flask.session["counter"]
+
+                executor = futures.ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(child)
+                results.append(future.result())
+                executor.shutdown()
+
+            # Each child starts from the same snapshot (counter=0),
+            # so each independently increments to 1.
+            return flask.jsonify(
+                {"results": results, "parent": flask.session["counter"]}
+            )
+
+        app.secret_key = "test-secret"
+        rv = client.get("/")
+        data = rv.get_json()
+        assert data["results"] == [1, 1, 1]
+        assert data["parent"] == 0
